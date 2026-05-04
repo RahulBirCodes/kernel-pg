@@ -1,141 +1,122 @@
+#include <cstdlib>
 #include <iostream>
 #include <cuda_runtime.h>
 
-__global__ void tiledMatMul(float* a, float* b, float* c, int m, int k, int n) {
-    extern __shared__ float shared[];
+#define TILE_WIDTH 16
 
-    int tileWidth = blockDim.x;
-    float* aTile = shared;
-    float* bTile = shared + tileWidth * tileWidth;
+__global__ void tiledMatMul(float* M, float* N, float* P, int Width) {
+    __shared__ float Mds[TILE_WIDTH][TILE_WIDTH];
+    __shared__ float Nds[TILE_WIDTH][TILE_WIDTH];
 
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
     int bx = blockIdx.x;
     int by = blockIdx.y;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
 
-    int row = by * tileWidth + ty;
-    int col = bx * tileWidth + tx;
+    // Identify the row and column of the P element to work on
+    int Row = by * TILE_WIDTH + ty;
+    int Col = bx * TILE_WIDTH + tx;
 
-    float cValue = 0.0f;
-
-    int numPhases = (k + tileWidth - 1) / tileWidth;
-
-    for (int ph = 0; ph < numPhases; ++ph) {
-        int aCol = ph * tileWidth + tx;
-        int bRow = ph * tileWidth + ty;
-
-        if (row < m && aCol < k) {
-            aTile[ty * tileWidth + tx] = a[row * k + aCol];
-        } else {
-            aTile[ty * tileWidth + tx] = 0.0f;
-        }
-
-        if (bRow < k && col < n) {
-            bTile[ty * tileWidth + tx] = b[bRow * n + col];
-        } else {
-            bTile[ty * tileWidth + tx] = 0.0f;
-        }
-
+    // Loop over the M and N tiles required to compute P element
+    float Pvalue = 0.0f;
+    for (int ph = 0; ph < Width / TILE_WIDTH; ++ph) {
+        // Collaborative loading of M and N tiles into shared memory
+        Mds[ty][tx] = M[Row * Width + ph * TILE_WIDTH + tx];
+        Nds[ty][tx] = N[(ph * TILE_WIDTH + ty) * Width + Col];
         __syncthreads();
 
-        for (int i = 0; i < tileWidth; ++i) {
-            cValue += aTile[ty * tileWidth + i] * bTile[i * tileWidth + tx];
+        for (int k = 0; k < TILE_WIDTH; ++k) {
+            Pvalue += Mds[ty][k] * Nds[k][tx];
         }
 
         __syncthreads();
     }
 
-    if (row < m && col < n) {
-        c[row * n + col] = cValue;
-    }
+    P[Row * Width + Col] = Pvalue;
 }
 
 int main() {
-    const int m = 5;
-    const int k = 7;
-    const int n = 6;
-    const int tileWidth = 4;
+    const int Width = 16;
+    const int size = Width * Width;
 
-    const int aSize = m * k;
-    const int bSize = k * n;
-    const int cSize = m * n;
+    float* hM = new float[size];
+    float* hN = new float[size];
+    float* hP = new float[size];
 
-    float hA[aSize];
-    float hB[bSize];
-    float hC[cSize];
-
-    for (int row = 0; row < m; ++row) {
-        for (int col = 0; col < k; ++col) {
-            hA[row * k + col] = static_cast<float>(row * k + col + 1);
+    std::srand(1234);
+    for (int row = 0; row < Width; ++row) {
+        for (int col = 0; col < Width; ++col) {
+            hM[row * Width + col] = static_cast<float>(std::rand() % 10);
+            hN[row * Width + col] = (row == col) ? 1.0f : 0.0f;
         }
     }
 
-    for (int row = 0; row < k; ++row) {
-        for (int col = 0; col < n; ++col) {
-            hB[row * n + col] = static_cast<float>(row * n + col + 1);
-        }
-    }
+    float* dM;
+    float* dN;
+    float* dP;
 
-    float* dA;
-    float* dB;
-    float* dC;
+    cudaMalloc((void**)&dM, size * sizeof(float));
+    cudaMalloc((void**)&dN, size * sizeof(float));
+    cudaMalloc((void**)&dP, size * sizeof(float));
 
-    cudaMalloc((void**)&dA, aSize * sizeof(float));
-    cudaMalloc((void**)&dB, bSize * sizeof(float));
-    cudaMalloc((void**)&dC, cSize * sizeof(float));
+    cudaMemcpy(dM, hM, size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(dN, hN, size * sizeof(float), cudaMemcpyHostToDevice);
 
-    cudaMemcpy(dA, hA, aSize * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(dB, hB, bSize * sizeof(float), cudaMemcpyHostToDevice);
+    dim3 dimBlock(TILE_WIDTH, TILE_WIDTH);
+    dim3 dimGrid(Width / TILE_WIDTH, Width / TILE_WIDTH);
 
-    dim3 blockSize(tileWidth, tileWidth);
-    dim3 gridSize((n + tileWidth - 1) / tileWidth,
-                  (m + tileWidth - 1) / tileWidth);
-
-    size_t sharedBytes = 2 * tileWidth * tileWidth * sizeof(float);
-
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
-
-    std::cout << "Shared memory available per block: " << prop.sharedMemPerBlock << " bytes" << std::endl;
-    std::cout << "Shared memory used by one block: " << sharedBytes << " bytes" << std::endl;
-    std::cout << "Grid size: (" << gridSize.x << ", " << gridSize.y << ")" << std::endl;
-    std::cout << "Block size: (" << blockSize.x << ", " << blockSize.y << ")" << std::endl;
-
-    tiledMatMul<<<gridSize, blockSize, sharedBytes>>>(dA, dB, dC, m, k, n);
+    tiledMatMul<<<dimGrid, dimBlock>>>(dM, dN, dP, Width);
     cudaDeviceSynchronize();
 
-    cudaMemcpy(hC, dC, cSize * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(hP, dP, size * sizeof(float), cudaMemcpyDeviceToHost);
 
-    std::cout << std::endl;
-    std::cout << "Matrix A (" << m << "x" << k << "):" << std::endl;
-    for (int row = 0; row < m; ++row) {
-        for (int col = 0; col < k; ++col) {
-            std::cout << hA[row * k + col] << "\t";
+    std::cout << "Random matrix M:" << std::endl;
+    for (int row = 0; row < Width; ++row) {
+        for (int col = 0; col < Width; ++col) {
+            std::cout << hM[row * Width + col] << "\t";
         }
         std::cout << std::endl;
     }
 
     std::cout << std::endl;
-    std::cout << "Matrix B (" << k << "x" << n << "):" << std::endl;
-    for (int row = 0; row < k; ++row) {
-        for (int col = 0; col < n; ++col) {
-            std::cout << hB[row * n + col] << "\t";
+    std::cout << "Identity matrix N:" << std::endl;
+    for (int row = 0; row < Width; ++row) {
+        for (int col = 0; col < Width; ++col) {
+            std::cout << hN[row * Width + col] << "\t";
         }
         std::cout << std::endl;
     }
 
     std::cout << std::endl;
-    std::cout << "Matrix C = A x B (" << m << "x" << n << "):" << std::endl;
-    for (int row = 0; row < m; ++row) {
-        for (int col = 0; col < n; ++col) {
-            std::cout << hC[row * n + col] << "\t";
+    std::cout << "Matrix P = M x N:" << std::endl;
+    for (int row = 0; row < Width; ++row) {
+        for (int col = 0; col < Width; ++col) {
+            std::cout << hP[row * Width + col] << "\t";
         }
         std::cout << std::endl;
     }
 
-    cudaFree(dA);
-    cudaFree(dB);
-    cudaFree(dC);
+    bool matches = true;
+    for (int i = 0; i < size; ++i) {
+        if (static_cast<int>(hM[i]) != static_cast<int>(hP[i])) {
+            matches = false;
+            break;
+        }
+    }
+
+    std::cout << std::endl;
+    if (matches) {
+        std::cout << "Check passed: hM and hP match." << std::endl;
+    } else {
+        std::cout << "Check failed: hM and hP do not match." << std::endl;
+    }
+
+    cudaFree(dM);
+    cudaFree(dN);
+    cudaFree(dP);
+    delete[] hM;
+    delete[] hN;
+    delete[] hP;
 
     return 0;
 }
